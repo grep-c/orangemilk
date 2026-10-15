@@ -1,0 +1,47 @@
+---
+- name: Bootstrap EC2 instance for k3s
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  vars:
+    packages:
+      - curl
+      - apt-transport-https
+      - ca-certificates
+      - gnupg
+      - software-properties-common
+      - vim
+      - git
+
+  tasks:
+
+    - name: Update all APT packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+      tags: update
+
+    - name: Install required packages
+      apt:
+        name: "{{ packages }}"
+        state: present
+      tags: packages
+
+    - name: Disable swap immediately (required for Kubernetes)
+      command: swapoff -a
+      tags: k8s
+      ignore_errors: yes
+
+    - name: Ensure swap stays disabled after reboot
+      replace:
+        path: /etc/fstab
+        regexp: '^\s*(.+\s+swap\s+.+)$'
+        replace: '# \1'
+      tags: k8s
+
+    - name: Ensure python3 is installed (required by Ansible)
+      apt:
+        name: python3
+        state: present
+      tags: python

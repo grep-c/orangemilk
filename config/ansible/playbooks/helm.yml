@@ -1,0 +1,34 @@
+---
+- name: Install Helm on k3s node
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  vars:
+    helm_version: v3.12.0   # pin a stable Helm version
+
+  tasks:
+
+    - name: Download and install Helm
+      shell: |
+        curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+      args:
+        creates: /usr/local/bin/helm
+      tags: helm
+
+    - name: Ensure helm binary is executable
+      file:
+        path: /usr/local/bin/helm
+        mode: '0755'
+      tags: helm
+
+    - name: Verify Helm installation
+      shell: helm version --short
+      register: helm_version_output
+      changed_when: false
+      tags: helm
+
+    - name: Show installed Helm version
+      debug:
+        msg: "{{ helm_version_output.stdout }}"
+      tags: helm

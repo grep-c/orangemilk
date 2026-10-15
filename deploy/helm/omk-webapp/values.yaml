@@ -1,0 +1,15 @@
+replicaCount: 2
+
+image:
+  repository: public.ecr.aws/r2y0a2d0/orangemilk
+  tag: "1"
+  pullPolicy: IfNotPresent
+  
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: true
+  className: traefik
+  host: ""

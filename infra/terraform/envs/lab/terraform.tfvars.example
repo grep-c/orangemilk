@@ -1,0 +1,2 @@
+ssh_keypair_name = "omk-ssh-lab"
+allowed_ssh_cidr = "0.0.0.0/0"

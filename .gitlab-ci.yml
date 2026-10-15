@@ -1,0 +1,230 @@
+stages:
+  - build
+  - terraform
+  - bootstrap
+  - deploy
+  - verify
+  - destroy
+
+default:
+  interruptible: true
+
+# ----------------------------
+# Variables (set in GitLab CI/CD settings)
+# ----------------------------
+# Required GitLab variables:
+# - AWS_ACCESS_KEY_ID
+# - AWS_SECRET_ACCESS_KEY
+# - AWS_DEFAULT_REGION              (e.g. us-east-1)
+# - TF_VAR_ssh_keypair_name         (e.g. omk-ssh-lab)
+# - OMK_SSH_PRIVATE_KEY             (private key that matches the AWS keypair; masked/protected)
+#
+# Optional:
+# - OMK_SSH_USER                    (default: ubuntu)
+# - OMK_ALLOWED_SSH_CIDR            (if you wire it; default in TF is 0.0.0.0/0)
+
+variables:
+  TF_ROOT: "infra/terraform/envs/lab"
+  ANSIBLE_ROOT: "config/ansible"
+  OMK_SSH_USER: "ubuntu"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  OMK_IMAGE_REPOSITORY: "public.ecr.aws/r2y0a2d0/orangemilk"
+
+
+# ----------------------------
+# Application image build
+# ----------------------------
+
+build:image:
+  stage: build
+  image: docker:29-cli
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  variables:
+    DOCKER_HOST: "unix:///var/run/docker.sock"
+
+  before_script:
+    - apk add --no-cache aws-cli
+    - aws ecr-public get-login-password --region us-east-1 |
+        docker login --username AWS --password-stdin public.ecr.aws
+
+  script:
+    - export IMAGE_TAG="$CI_COMMIT_SHORT_SHA"
+    - docker build -t "${OMK_IMAGE_REPOSITORY}:${IMAGE_TAG}" ./app
+    - docker push "${OMK_IMAGE_REPOSITORY}:${IMAGE_TAG}"
+    - echo "IMAGE_REPOSITORY=${OMK_IMAGE_REPOSITORY}" > image.env
+    - echo "IMAGE_TAG=${IMAGE_TAG}" >> image.env
+
+  artifacts:
+    reports:
+      dotenv: image.env
+
+
+# ----------------------------
+# Terraform jobs
+# ----------------------------
+
+terraform:fmt:
+  stage: terraform
+  image:
+    name: hashicorp/terraform:1.7
+    entrypoint: [""]
+  rules:
+    - if: $CI_PIPELINE_SOURCE
+  script:
+    - cd "$TF_ROOT"
+    - terraform fmt -recursive -check
+
+terraform:validate:
+  stage: terraform
+  image:
+    name: hashicorp/terraform:1.7
+    entrypoint: [""]
+  rules:
+    - if: $CI_PIPELINE_SOURCE
+  script:
+    - cd "$TF_ROOT"
+    - terraform init -no-color
+    - terraform validate -no-color
+
+terraform:plan:
+  stage: terraform
+  image:
+    name: hashicorp/terraform:1.7
+    entrypoint: [""]
+  rules:
+    - if: $CI_PIPELINE_SOURCE
+  script:
+    - export TF_VAR_allowed_ssh_cidr="$(wget -qO- https://checkip.amazonaws.com)/32"
+    - cd "$TF_ROOT"
+    - terraform init -no-color
+    - terraform plan -no-color -out=plan.tfplan
+    - terraform show -no-color plan.tfplan > plan.txt
+  artifacts:
+    expire_in: 7 days
+    paths:
+      - "$TF_ROOT/plan.tfplan"
+      - "$TF_ROOT/plan.txt"
+
+terraform:apply:
+  stage: terraform
+  image:
+    name: hashicorp/terraform:1.7
+    entrypoint: [""]
+  needs: ["terraform:plan"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      # when: manual
+  script:
+    - cd "$TF_ROOT"
+    - terraform init -no-color
+    - terraform apply -auto-approve plan.tfplan
+    - echo "OMK_PUBLIC_IP=$(terraform output -raw public_ip)" >> "$CI_PROJECT_DIR/terraform.env"
+    - echo "OMK_SSH_USER=$(terraform output -raw ssh_user)" >> "$CI_PROJECT_DIR/terraform.env"
+  artifacts:
+    reports:
+      dotenv: terraform.env
+
+# ----------------------------
+# Bootstrap jobs (Ansible)
+# ----------------------------
+
+bootstrap:k3s:
+  stage: bootstrap
+  image: alpine/ansible:latest
+  needs: ["terraform:apply"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  before_script:
+    # Only need SSH setup
+    - mkdir -p ~/.ssh
+    - cp "$OMK_SSH_PRIVATE_KEY" ~/.ssh/omk_lab
+    - chmod 600 ~/.ssh/omk_lab
+    - printf "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null\n" > ~/.ssh/config
+  script:
+    - echo "Target host '${OMK_PUBLIC_IP}'"
+    - echo "User '${OMK_SSH_USER}'"
+    - cd "$CI_PROJECT_DIR/$ANSIBLE_ROOT"
+    - ansible-playbook -i "${OMK_PUBLIC_IP}," playbooks/bootstrap.yml -u "$OMK_SSH_USER" --private-key ~/.ssh/omk_lab
+    - ansible-playbook -i "${OMK_PUBLIC_IP}," playbooks/k3s.yml       -u "$OMK_SSH_USER" --private-key ~/.ssh/omk_lab
+    - ansible-playbook -i "${OMK_PUBLIC_IP}," playbooks/helm.yml      -u "$OMK_SSH_USER" --private-key ~/.ssh/omk_lab
+
+
+# ----------------------------
+# Application deployment jobs
+# ----------------------------
+
+deploy:helm:
+  stage: deploy
+  image: alpine:latest
+  needs:
+    - job: build:image
+      artifacts: true
+    - job: terraform:apply
+      artifacts: true
+    - job: bootstrap:k3s
+
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+  before_script:
+    - apk add --no-cache openssh-client
+    - mkdir -p ~/.ssh
+    - cp "$OMK_SSH_PRIVATE_KEY" ~/.ssh/omk_lab
+    - chmod 600 ~/.ssh/omk_lab
+    - printf "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null\n" > ~/.ssh/config
+
+  script:
+    - echo "Deploying OMK webapp to ${OMK_PUBLIC_IP}"
+
+    - |
+      scp -i ~/.ssh/omk_lab -r \
+        deploy/helm/omk-webapp \
+        "${OMK_SSH_USER}@${OMK_PUBLIC_IP}:/home/${OMK_SSH_USER}/"
+
+    - |
+      ssh -i ~/.ssh/omk_lab "${OMK_SSH_USER}@${OMK_PUBLIC_IP}" \
+        "KUBECONFIG=/home/${OMK_SSH_USER}/.kube/config \
+        helm upgrade --install omk-webapp /home/${OMK_SSH_USER}/omk-webapp \
+        --set image.repository='${IMAGE_REPOSITORY}' \
+        --set image.tag='${IMAGE_TAG}' \
+        --wait --timeout 5m"
+
+    - ssh -i ~/.ssh/omk_lab "${OMK_SSH_USER}@${OMK_PUBLIC_IP}" \
+        "KUBECONFIG=/home/${OMK_SSH_USER}/.kube/config kubectl get deploy,pods,svc,ingress"
+
+
+# ----------------------------
+# Verification jobs
+# ----------------------------
+
+smoke:test:
+  stage: verify
+  image: alpine:latest
+  needs:
+    - job: terraform:apply
+      artifacts: true
+    - job: deploy:helm
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+  before_script:
+    - apk add --no-cache curl
+
+  script:
+    - echo "Testing OMK webapp at http://${OMK_PUBLIC_IP}"
+    - ./app/tests/smoke.sh "http://${OMK_PUBLIC_IP}"
+
+terraform:destroy:
+  stage: destroy
+  image:
+    name: hashicorp/terraform:1.7
+    entrypoint: [""]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+  script:
+    - cd "$TF_ROOT"
+    - terraform init -no-color
+    - terraform destroy -no-color -auto-approve

@@ -1,0 +1,68 @@
+---
+- name: Install k3s single-node Kubernetes cluster
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  vars:
+    k3s_version: v1.30.6+k3s1   # pin a stable k3s version
+
+  tasks:
+
+    - name: Download and install k3s
+      shell: |
+        curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION={{ k3s_version }} sh -
+      args:
+        creates: /usr/local/bin/k3s
+      tags: k3s
+
+    - name: Wait for k3s service to be active
+      systemd:
+        name: k3s
+        state: started
+        enabled: yes
+      tags: k3s
+
+    - name: Ensure .kube directory exists for user
+      file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+      tags: k3s
+
+    - name: Copy kubeconfig to user's home
+      copy:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+      tags: k3s
+
+    - name: Set KUBECONFIG for user
+      lineinfile:
+        path: "/home/{{ ansible_user }}/.bashrc"
+        line: 'export KUBECONFIG="$HOME/.kube/config"'
+        state: present
+      tags: k3s
+
+    - name: Add kubectl alias
+      lineinfile:
+        path: "/home/{{ ansible_user }}/.bashrc"
+        line: "alias k='kubectl'"
+        state: present
+      tags: k3s
+
+    - name: Verify k3s node is Ready
+      shell: kubectl get nodes
+      environment:
+        KUBECONFIG: "/home/{{ ansible_user }}/.kube/config"
+      register: nodes_status
+      retries: 5
+      delay: 10
+      until: '"Ready" in nodes_status.stdout'
+      changed_when: false
+      tags: k3s
